@@ -1,5 +1,6 @@
 import os,sqlite3,secrets,re,hmac
 from flask import Flask,request,redirect,session,abort,render_template_string,url_for
+from werkzeug.security import generate_password_hash,check_password_hash
 app=Flask(__name__);app.secret_key=os.environ.get("SECRET_KEY",secrets.token_hex(32))
 app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE="Lax",SESSION_COOKIE_SECURE=os.environ.get("HTTPS","0")=="1")
 DB=os.environ.get("DATABASE_PATH","/tmp/podcast-trail.db")
@@ -12,6 +13,8 @@ def setup():
   c.executescript("""CREATE TABLE IF NOT EXISTS creators(id INTEGER PRIMARY KEY,handle TEXT UNIQUE,status TEXT DEFAULT 'pending',token TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY,title TEXT,url TEXT,active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS clicks(id INTEGER PRIMARY KEY,creator INTEGER,visitor TEXT,kind TEXT,episode INTEGER,created TEXT DEFAULT CURRENT_TIMESTAMP);""")
+  cols=[r["name"] for r in c.execute("PRAGMA table_info(creators)")]
+  if "password_hash" not in cols:c.execute("ALTER TABLE creators ADD COLUMN password_hash TEXT")
   if not c.execute("SELECT 1 FROM episodes").fetchone():c.execute("INSERT INTO episodes(title,url) VALUES (?,?)",("Featured Flurzi episode",EP))
 setup()
 CSS="""<style>body{font-family:Inter,system-ui,sans-serif;background:#0a0b19;color:#f7f6ff;margin:0}header{padding:22px 7%;border-bottom:1px solid #292842;display:flex;justify-content:space-between}main{max-width:1060px;margin:45px auto;padding:0 22px}h1{font-size:clamp(30px,6vw,58px);letter-spacing:-2px}a{color:#c2b5ff}p,small{color:#b7b5d0}section,.tile{background:#17172c;border:1px solid #343150;border-radius:20px;padding:24px;margin:14px 0}button,.btn{background:linear-gradient(110deg,#824eff,#df56c4);color:white;border:0;padding:13px 20px;border-radius:12px;cursor:pointer;text-decoration:none;display:inline-block}input{background:#24233a;border:1px solid #514d74;color:white;border-radius:10px;padding:13px;margin:8px;max-width:90%}.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}.big{font-size:36px;font-weight:800;color:#e0c8ff}form{display:inline-block}table{width:100%;border-collapse:collapse}td,th{padding:12px;border-bottom:1px solid #343150;text-align:left;overflow-wrap:anywhere}.muted{color:#b7b5d0}</style>"""
@@ -32,13 +35,52 @@ def creators():
  msg=""
  if request.method=="POST":
   handle=request.form.get("handle","").strip().lower().lstrip("@")
+  password=request.form.get("password","")
   if not re.fullmatch(r"[a-z0-9._]{2,24}",handle):msg="Enter a valid TikTok handle."
+  elif len(password)<12 or len(password)>128:msg="Choose a password between 12 and 128 characters."
   else:
    try:
-    with db() as c:c.execute("INSERT INTO creators(handle) VALUES (?)",(handle,))
-    msg="Application received! Your handle is pending Flurzi approval."
-   except sqlite3.IntegrityError:msg="This handle has already applied."
- return page("<h1>Turn your audience into impact.</h1><p>Flurzi Podcast creator programme. Apply with your exact TikTok handle; no account signup required.</p><section><h2>Apply as a creator</h2><form method='post'><input name='handle' placeholder='@yourtiktok' required><button>Request approval</button></form><p>{{msg}}</p></section><p>Approved creators receive private dashboard and share links. Spotify outbound clicks are tracked; Spotify listening duration and follows cannot be independently verified here.</p>",msg=msg)
+    with db() as c:c.execute("INSERT INTO creators(handle,password_hash) VALUES (?,?)",(handle,generate_password_hash(password)))
+    msg="Application received! Sign in anytime to check your approval status."
+   except sqlite3.IntegrityError:msg="This handle has already applied. Sign in instead."
+ return page("<h1>Become a Flurzi creator.</h1><p>Create an account using your TikTok handle. After approval, sign in to access your creator studio.</p><section><h2>Apply as a creator</h2><form method='post'><input name='handle' placeholder='@yourtiktok' autocomplete='username' required><input type='password' name='password' minlength='12' maxlength='128' placeholder='Create password (12+ characters)' autocomplete='new-password' required><button>Apply</button></form><p>{{msg}}</p></section><p>Already applied? <a href='/creator/login'>Sign in here</a>.</p>",msg=msg)
+@app.route("/creator/login",methods=["GET","POST"])
+def creator_login():
+ msg=""
+ if request.method=="POST":
+  handle=request.form.get("handle","").strip().lower().lstrip("@")
+  with db() as c:p=c.execute("SELECT * FROM creators WHERE handle=?",(handle,)).fetchone()
+  if p and p["password_hash"] and check_password_hash(p["password_hash"],request.form.get("password","")):
+   session.clear();session["creator_id"]=p["id"];return redirect("/creator/home")
+  msg="Incorrect handle or password. If you applied before accounts were introduced, contact Flurzi admin for account setup."
+ return page("<h1>Creator sign in</h1><section><form method='post'><input name='handle' placeholder='TikTok handle' autocomplete='username' required><input type='password' name='password' placeholder='Password' autocomplete='current-password' required><button>Sign in</button></form><p>{{msg}}</p></section><p>New creator? <a href='/creators'>Apply here</a>.</p>",msg=msg)
+@app.get("/creator/home")
+def creator_home():
+ cid=session.get("creator_id")
+ if not cid:return redirect("/creator/login")
+ with db() as c:p=c.execute("SELECT * FROM creators WHERE id=?",(cid,)).fetchone()
+ if not p:session.clear();return redirect("/creator/login")
+ if p["status"]!="approved":return page("<h1>Application status: {{status}}</h1><p>Hi @{{handle}}. Your dashboard will unlock once Flurzi approves your application.</p><form method='post' action='/creator/logout'><button>Sign out</button></form>",status=p["status"],handle=p["handle"])
+ return redirect("/creator/studio")
+@app.get("/creator/studio")
+def creator_studio():
+ cid=session.get("creator_id")
+ if not cid:return redirect("/creator/login")
+ with db() as c:p=c.execute("SELECT * FROM creators WHERE id=? AND status='approved'",(cid,)).fetchone()
+ if not p:return redirect("/creator/home")
+ return dashboard_content(p)
+@app.get("/api/creator/stats")
+def creator_stats():
+ from flask import jsonify
+ cid=session.get("creator_id")
+ if not cid:abort(401)
+ with db() as c:p=c.execute("SELECT * FROM creators WHERE id=? AND status='approved'",(cid,)).fetchone()
+ if not p:abort(403)
+ s=stat(cid)
+ return jsonify(visits=s.get("visit",(0,0))[0],unique=s.get("visit",(0,0))[1],clicks=s.get("show",(0,0))[0]+s.get("episode",(0,0))[0])
+@app.post("/creator/logout")
+def creator_logout():
+ session.clear();return redirect("/creator/login")
 @app.route("/admin/login",methods=["GET","POST"])
 def login():
  msg=""
@@ -54,7 +96,7 @@ def admin():
  with db() as c:
   people=c.execute("SELECT * FROM creators ORDER BY id DESC").fetchall()
   episodes=c.execute("SELECT * FROM episodes ORDER BY id DESC").fetchall()
- return page("""<h1>Command centre</h1><p>Approve TikTok handles, manage episodes, and review measurable referral activity.</p><section><h2>Creator applications</h2><table><tr><th>Handle</th><th>Status</th><th>Visits / unique</th><th>Spotify clicks</th><th>Actions</th></tr>{% for p in people %}<tr><td>@{{p.handle}}</td><td>{{p.status}}{% if p.token %}<p><a href='/dashboard/{{p.token}}'>Dashboard</a> · <a href='/c/{{p.token}}'>Share URL</a></p>{% endif %}</td><td>{{stats[p.id].get('visit',(0,0))[0]}} / {{stats[p.id].get('visit',(0,0))[1]}}</td><td>{{stats[p.id].get('show',(0,0))[0]+stats[p.id].get('episode',(0,0))[0]}}</td><td><form method='post' action='/admin/creator/{{p.id}}/approve'><button>Approve</button></form> <form method='post' action='/admin/creator/{{p.id}}/revoke'><button>Revoke</button></form></td></tr>{% endfor %}</table></section><section><h2>Episodes</h2><form method='post' action='/admin/episode'><input name='title' placeholder='Episode title' required><input name='url' placeholder='https://open.spotify.com/episode/...' required><button>Add episode</button></form>{% for e in episodes %}<p>{{e.title}} · {{'Active' if e.active else 'Hidden'}} <form method='post' action='/admin/episode/{{e.id}}/toggle'><button>Toggle</button></form></p>{% endfor %}</section><form method='post' action='/admin/logout'><button>Sign out</button></form>""",people=people,episodes=episodes,stats={p["id"]:stat(p["id"]) for p in people})
+ return page("""<h1>Command centre</h1><p>Approve TikTok handles, manage episodes, and review measurable referral activity.</p><section><h2>Creator applications</h2><table><tr><th>Handle</th><th>Status</th><th>Visits / unique</th><th>Spotify clicks</th><th>Actions</th></tr>{% for p in people %}<tr><td>@{{p.handle}}</td><td>{{p.status}}{% if p.token %}<p><a href='/dashboard/{{p.token}}'>Dashboard</a> · <a href='/c/{{p.token}}'>Share URL</a></p>{% endif %}</td><td>{{stats[p.id].get('visit',(0,0))[0]}} / {{stats[p.id].get('visit',(0,0))[1]}}</td><td>{{stats[p.id].get('show',(0,0))[0]+stats[p.id].get('episode',(0,0))[0]}}</td><td><form method='post' action='/admin/creator/{{p.id}}/approve'><button>Approve</button></form> <form method='post' action='/admin/creator/{{p.id}}/revoke'><button>Revoke</button></form> {% if not p.password_hash %}<small>Legacy account: no password set</small>{% endif %}</td></tr>{% endfor %}</table></section><section><h2>Episodes</h2><form method='post' action='/admin/episode'><input name='title' placeholder='Episode title' required><input name='url' placeholder='https://open.spotify.com/episode/...' required><button>Add episode</button></form>{% for e in episodes %}<p>{{e.title}} · {{'Active' if e.active else 'Hidden'}} <form method='post' action='/admin/episode/{{e.id}}/toggle'><button>Toggle</button></form></p>{% endfor %}</section><form method='post' action='/admin/logout'><button>Sign out</button></form>""",people=people,episodes=episodes,stats={p["id"]:stat(p["id"]) for p in people})
 @app.post("/admin/logout")
 def logout():auth();session.clear();return redirect("/admin/login")
 @app.post("/admin/creator/<int:cid>/<action>")
@@ -105,12 +147,16 @@ def go(token,kind,eid):
 def dashboard(token):
  p=creator(token)
  if not p:abort(404)
- return page("""<h1>@{{p.handle}}'s creator studio</h1><p>Your live referral performance · refreshes every 15 seconds</p><div class='tiles'><div class='tile'><p>Page visits</p><div class='big' id='visits'>—</div></div><div class='tile'><p>Unique visitors</p><div class='big' id='unique'>—</div></div><div class='tile'><p>Spotify outbound clicks</p><div class='big' id='clicks'>—</div></div><div class='tile'><p>Verified Spotify listens</p><div class='big'>Unavailable</div></div></div><section><h2>Your referral link</h2><p id='link'></p><button onclick='navigator.clipboard.writeText(location.origin+"/c/{{p.token}}")'>Copy referral link</button></section><p>Spotify does not share per-person duration, attributed follows, or verified listens through this link. Clicks are not eligible payout listens. Private dashboard link: keep it confidential.</p><script>const link=location.origin+"/c/{{p.token}}";document.getElementById("link").textContent=link;async function refresh(){const r=await fetch("/api/dashboard/{{p.token}}");if(!r.ok)return;const d=await r.json();for(const k of ["visits","unique","clicks"])document.getElementById(k).textContent=d[k].toLocaleString()}refresh();setInterval(refresh,15000)</script>""",p=p)
+ if not session.get("admin") and session.get("creator_id")!=p["id"]:return redirect("/creator/login")
+ return dashboard_content(p)
+def dashboard_content(p):
+ return page("""<h1>@{{p.handle}}'s creator studio</h1><p>Your live referral performance · refreshes every 15 seconds</p><div class='tiles'><div class='tile'><p>Page visits</p><div class='big' id='visits'>—</div></div><div class='tile'><p>Unique visitors</p><div class='big' id='unique'>—</div></div><div class='tile'><p>Spotify outbound clicks</p><div class='big' id='clicks'>—</div></div><div class='tile'><p>Verified Spotify listens</p><div class='big'>Unavailable</div></div></div><section><h2>Your referral link</h2><p id='link'></p><button onclick='navigator.clipboard.writeText(location.origin+"/c/{{p.token}}")'>Copy referral link</button></section><p>Spotify does not share per-person duration, attributed follows, or verified listens through this link. Clicks are not eligible payout listens. Private dashboard link: keep it confidential.</p><script>const link=location.origin+"/c/{{p.token}}";document.getElementById("link").textContent=link;async function refresh(){const r=await fetch("/api/creator/stats");if(!r.ok)return;const d=await r.json();for(const k of ["visits","unique","clicks"])document.getElementById(k).textContent=d[k].toLocaleString()}refresh();setInterval(refresh,15000)</script>""",p=p)
 @app.get("/api/dashboard/<token>")
 def dashboard_api(token):
  from flask import jsonify
  p=creator(token)
  if not p:abort(404)
+ if not session.get("admin") and session.get("creator_id")!=p["id"]:abort(403)
  s=stat(p["id"])
  return jsonify(visits=s.get("visit",(0,0))[0],unique=s.get("visit",(0,0))[1],clicks=s.get("show",(0,0))[0]+s.get("episode",(0,0))[0])
 if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.environ.get("PORT","5000")))
